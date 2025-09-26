@@ -1,20 +1,13 @@
 """
-Core model handler for Meditron3-Qwen2.5
-Handles model loading, inference, and memory management
+Optimized model handler for Meditron3-Qwen2.5
 """
 
 import torch
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    BitsAndBytesConfig,
-    TextStreamer
-)
-from typing import Optional, Dict, List, Any, Union, Generator
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 import sys
 from loguru import logger
-import gc
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -22,26 +15,31 @@ from config.settings import settings, get_project_root
 
 
 class MeditronModel:
-    """
-    Meditron3-Qwen2.5 model handler with optimized inference
-    """
+    """Meditron3-Qwen2.5模型处理器"""
     
     def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path or str(get_project_root() / settings.model.model_path)
         self.model = None
         self.tokenizer = None
-        self.device = None
+        self.device = self._setup_device()
         self.is_loaded = False
         
-        # Setup logging
+        # 设置日志
         logger.add(
             get_project_root() / "logs" / "model.log",
             level=settings.logging.log_level,
             rotation="10 MB"
         )
     
+    def _setup_device(self) -> str:
+        """设置并返回最优GPU设备"""
+        if not torch.cuda.is_available():
+            logger.warning("⚠️ CUDA不可用，使用CPU（推理较慢）")
+            return "cpu"
+        return "cuda:0"
+    
     def _get_quantization_config(self) -> Optional[BitsAndBytesConfig]:
-        """Get quantization configuration for memory optimization"""
+        """获取量化配置以优化显存使用"""
         if settings.model.load_in_4bit:
             return BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -54,258 +52,209 @@ class MeditronModel:
         return None
     
     def load_model(self) -> bool:
-        """
-        Load the Meditron3-Qwen2.5 model and tokenizer
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        """加载模型和分词器"""
         try:
-            logger.info("🚀 Loading Meditron3-Qwen2.5 model...")
+            logger.info("🚀 加载 Meditron3-Qwen2.5 模型...")
             
-            # Check if model path exists
-            model_path = Path(self.model_path)
-            if not model_path.exists():
-                logger.error(f"❌ Model path does not exist: {model_path}")
+            # 检查模型路径
+            if not Path(self.model_path).exists():
+                logger.error(f"❌ 模型路径不存在: {self.model_path}")
                 return False
             
-            # Determine device
-            if torch.cuda.is_available():
-                self.device = "cuda"
-                logger.info(f"🚀 Using GPU: {torch.cuda.get_device_name()}")
-            else:
-                self.device = "cpu"
-                logger.warning("⚠️ Using CPU (slow inference)")
-            
-            # Load tokenizer
-            logger.info("📚 Loading tokenizer...")
+            # 加载分词器
+            logger.info("📚 加载分词器...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
                 use_fast=True
             )
             
-            # Set pad token if not exists
+            # 设置填充token
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            logger.info(f"✅ Tokenizer loaded: vocab_size={self.tokenizer.vocab_size}")
+            logger.info(f"✅ 分词器加载完成: vocab_size={self.tokenizer.vocab_size}")
             
-            # Prepare model loading arguments
+            # 准备模型加载参数
             model_kwargs = {
-                "torch_dtype": getattr(torch, settings.model.torch_dtype),
-                "device_map": settings.model.device_map,
+                "dtype": getattr(torch, settings.model.dtype),
+                "device_map": self.device if self.device.startswith("cuda:") else "auto",
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,
             }
             
-            # Add quantization if specified
+            # 添加量化配置
             quantization_config = self._get_quantization_config()
             if quantization_config:
                 model_kwargs["quantization_config"] = quantization_config
-                logger.info("🔧 Using quantization for memory optimization")
+                logger.info("🔧 使用量化优化显存")
             
-            # Load model
-            logger.info("🧠 Loading model (this may take a while)...")
+            # 加载模型
+            logger.info("🧠 加载模型（这可能需要一些时间）...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 **model_kwargs
             )
             
-            # Set model to evaluation mode
             self.model.eval()
-            
-            logger.info("✅ Model loaded successfully")
             self.is_loaded = True
             
-            # Log model info
+            # 显示模型信息
             total_params = sum(p.numel() for p in self.model.parameters())
-            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(f"✅ 模型加载成功")
+            logger.info(f"📊 总参数量: {total_params:,}")
             
-            logger.info(f"📊 Total parameters: {total_params:,}")
-            logger.info(f"🔧 Trainable parameters: {trainable_params:,}")
-            
-            # Clear cache
+            # 清理缓存
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
             return True
             
         except Exception as e:
-            logger.error(f"❌ Failed to load model: {str(e)}")
+            logger.error(f"❌ 模型加载失败: {e}")
             return False
     
     def generate_response(
         self,
         prompt: str,
-        max_new_tokens: int = None,
-        temperature: float = None,
-        top_p: float = None,
-        top_k: int = 50,
-        do_sample: bool = True,
-        repetition_penalty: float = 1.1,
-        stream: bool = False
-    ) -> Union[str, Generator[str, None, None]]:
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        stream: bool = False,
+        **kwargs
+    ):
         """
-        Generate response from the model
+        生成回复 - 支持普通和流式输出
         
         Args:
-            prompt: Input prompt
-            max_new_tokens: Maximum new tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p (nucleus) sampling
-            top_k: Top-k sampling
-            do_sample: Whether to use sampling
-            repetition_penalty: Repetition penalty
-            stream: Whether to stream the response
+            prompt: 输入提示
+            max_new_tokens: 最大生成token数
+            temperature: 温度参数
+            top_p: top-p采样参数
+            stream: 是否使用流式输出 (默认False)
+            **kwargs: 其他生成参数
         
         Returns:
-            Generated response string or generator for streaming
+            str: 普通模式返回完整回复字符串
+            Generator: 流式模式返回生成器，逐步输出文本
         """
         if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
+            raise RuntimeError("模型未加载，请先调用 load_model()")
         
-        # Use default values from settings if not provided
+        # 设置默认参数
         max_new_tokens = max_new_tokens or 512
         temperature = temperature or settings.model.temperature
         top_p = top_p or settings.model.top_p
+        repetition_penalty = repetition_penalty or settings.model.repetition_penalty
+        
+        # 准备生成参数
+        generation_params = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            **kwargs  # 允许传入其他参数
+        }
         
         try:
-            # Tokenize input
-            inputs = self.tokenizer.encode(
-                prompt, 
+            # 编码输入
+            inputs = self.tokenizer(
+                prompt,
                 return_tensors="pt",
-                add_special_tokens=True
+                add_special_tokens=True,
+                padding=True,
+                truncation=True,
+                max_length=settings.model.max_length
             )
             
-            if self.device == "cuda":
-                inputs = inputs.to(self.device)
+            # 移动到设备
+            if self.device.startswith("cuda"):
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Prepare generation arguments
-            generation_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "do_sample": do_sample,
-                "repetition_penalty": repetition_penalty,
-                "pad_token_id": self.tokenizer.eos_token_id,
-                "eos_token_id": self.tokenizer.eos_token_id,
-            }
+            # 生成回复
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    **generation_params,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
             
+            # 解码回复
+            response = self.tokenizer.decode(
+                outputs[0][len(inputs["input_ids"][0]):],
+                skip_special_tokens=True
+            ).strip()
+            
+            # 调试信息
+            if len(response) == 0:
+                logger.warning(f"⚠️ 生成了空回复，输入长度: {len(inputs['input_ids'][0])}, 输出长度: {len(outputs[0])}")
+                logger.warning(f"⚠️ 生成参数: {generation_params}")
+                # 尝试不跳过特殊token的解码
+                raw_response = self.tokenizer.decode(outputs[0][len(inputs["input_ids"][0]):])
+                logger.warning(f"⚠️ 原始输出: '{raw_response}'")
+            
+            # 根据stream参数决定返回方式
             if stream:
-                return self._generate_stream(inputs, **generation_kwargs)
+                return self._create_stream_generator(response)
             else:
-                return self._generate_complete(inputs, **generation_kwargs)
-                
+                return response
+            
         except Exception as e:
-            logger.error(f"❌ Generation failed: {str(e)}")
+            logger.error(f"❌ 生成回复时出错: {e}")
             raise
     
-    def _generate_complete(self, inputs: torch.Tensor, **kwargs) -> str:
-        """Generate complete response"""
-        with torch.no_grad():
-            outputs = self.model.generate(
-                inputs,
-                **kwargs
-            )
+    def _create_stream_generator(self, full_response: str):
+        """创建流式生成器"""
+        # 按词分割进行流式输出
+        words = full_response.split()
+        current_text = ""
         
-        # Decode response
-        response = self.tokenizer.decode(
-            outputs[0][len(inputs[0]):],  # Only new tokens
-            skip_special_tokens=True
-        )
+        for word in words:
+            current_text += word + " "
+            yield current_text.strip()
         
-        return response.strip()
+        # 确保最后返回完整响应
+        if current_text.strip() != full_response:
+            yield full_response
     
-    def _generate_stream(self, inputs: torch.Tensor, **kwargs) -> Generator[str, None, None]:
-        """Generate streaming response"""
-        # Note: This is a simplified streaming implementation
-        # For production, consider using transformers' TextStreamer or similar
-        
-        with torch.no_grad():
-            # For streaming, we generate token by token
-            generated_ids = inputs[0].tolist()
-            max_new_tokens = kwargs.get("max_new_tokens", 512)
-            
-            for _ in range(max_new_tokens):
-                # Get logits for next token
-                with torch.no_grad():
-                    outputs = self.model(torch.tensor([generated_ids]).to(self.device))
-                    logits = outputs.logits[0, -1, :]
-                
-                # Apply temperature
-                if kwargs.get("temperature", 1.0) != 1.0:
-                    logits = logits / kwargs["temperature"]
-                
-                # Apply top-k filtering
-                if kwargs.get("top_k", 0) > 0:
-                    top_k = kwargs["top_k"]
-                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                    logits[indices_to_remove] = float('-inf')
-                
-                # Apply top-p filtering
-                if kwargs.get("top_p", 1.0) < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > kwargs["top_p"]
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    indices_to_remove = sorted_indices_to_remove.scatter(0, sorted_indices, sorted_indices_to_remove)
-                    logits[indices_to_remove] = float('-inf')
-                
-                # Sample next token
-                if kwargs.get("do_sample", True):
-                    probs = torch.softmax(logits, dim=-1)
-                    next_token = torch.multinomial(probs, 1).item()
-                else:
-                    next_token = torch.argmax(logits).item()
-                
-                # Check for EOS
-                if next_token == self.tokenizer.eos_token_id:
-                    break
-                
-                generated_ids.append(next_token)
-                
-                # Decode and yield new token
-                new_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
-                yield new_text
-    
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        **generation_kwargs
-    ) -> str:
+    def chat(self, messages: List[Dict[str, str]], stream: bool = False, **kwargs):
         """
-        Chat interface with conversation history
+        多轮对话接口
         
         Args:
-            messages: List of message dicts with 'role' and 'content'
-            **generation_kwargs: Generation parameters
+            messages: 对话消息列表
+            stream: 是否使用流式输出 (默认False)
+            **kwargs: 其他生成参数
         
         Returns:
-            Assistant's response
+            str: 普通模式返回完整回复字符串
+            Generator: 流式模式返回生成器，逐步输出文本
         """
-        # Format messages into a prompt
-        # This is a simplified implementation - adjust based on model's chat format
-        prompt = ""
-        for message in messages:
-            role = message.get("role", "user")
-            content = message.get("content", "")
+        if not self.is_loaded:
+            raise RuntimeError("模型未加载，请先调用 load_model()")
+        
+        # 构建对话提示
+        prompt_parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
             
-            if role == "system":
-                prompt += f"System: {content}\n"
-            elif role == "user":
-                prompt += f"Human: {content}\n"
+            if role == "user":
+                prompt_parts.append(f"用户: {content}")
             elif role == "assistant":
-                prompt += f"Assistant: {content}\n"
+                prompt_parts.append(f"助手: {content}")
+            elif role == "system":
+                prompt_parts.append(f"系统: {content}")
         
-        prompt += "Assistant:"
+        prompt_parts.append("助手: ")
+        prompt = "\n".join(prompt_parts)
         
-        return self.generate_response(prompt, **generation_kwargs)
+        return self.generate_response(prompt, stream=stream, **kwargs)
     
     def unload_model(self):
-        """Unload model to free memory"""
+        """卸载模型释放显存"""
         if self.model is not None:
             del self.model
             self.model = None
@@ -314,67 +263,52 @@ class MeditronModel:
             del self.tokenizer
             self.tokenizer = None
         
-        self.is_loaded = False
-        
-        # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Force garbage collection
-        gc.collect()
-        
-        logger.info("🗑️ Model unloaded and memory cleared")
+        self.is_loaded = False
+        logger.info("🗑️ 模型已卸载，显存已释放")
     
-    def get_model_info(self) -> Dict[str, Any]:
-        """Get model information"""
-        if not self.is_loaded:
-            return {"status": "not_loaded"}
-        
-        info = {
-            "status": "loaded",
-            "model_path": self.model_path,
-            "device": self.device,
-            "vocab_size": self.tokenizer.vocab_size if self.tokenizer else None,
-        }
-        
-        if torch.cuda.is_available() and self.device == "cuda":
-            info.update({
-                "gpu_name": torch.cuda.get_device_name(),
-                "gpu_memory_allocated": torch.cuda.memory_allocated(),
-                "gpu_memory_reserved": torch.cuda.memory_reserved(),
-            })
-        
-        return info
+    def __del__(self):
+        """析构函数：自动清理资源"""
+        self.unload_model()
 
 
-# Global model instance
-model_instance = None
+# 全局模型实例
+_global_model: Optional[MeditronModel] = None
 
 
 def get_model() -> MeditronModel:
-    """Get or create global model instance"""
-    global model_instance
-    if model_instance is None:
-        model_instance = MeditronModel()
-    return model_instance
+    """获取全局模型实例（单例模式）"""
+    global _global_model
+    if _global_model is None:
+        _global_model = MeditronModel()
+    return _global_model
 
 
+def ensure_model_loaded() -> bool:
+    """确保模型已加载"""
+    model = get_model()
+    if not model.is_loaded:
+        return model.load_model()
+    return True
+
+
+# 主函数用于测试
 if __name__ == "__main__":
-    # Test the model
-    model = MeditronModel()
+    logger.info("🧪 开始模型测试...")
     
+    model = MeditronModel()
     if model.load_model():
-        print("✅ Model loaded successfully")
+        logger.info("✅ 模型加载成功，开始测试推理...")
         
-        # Test generation
-        test_prompt = "What is the function of brain extracellular space?"
+        test_prompt = "请简单介绍一下ECS (Extracellular Space) 的作用。"
         response = model.generate_response(test_prompt, max_new_tokens=100)
-        print(f"💬 Response: {response}")
         
-        # Print model info
-        info = model.get_model_info()
-        print(f"📊 Model info: {info}")
+        logger.info(f"📝 测试提示: {test_prompt}")
+        logger.info(f"🤖 模型回复: {response}")
         
         model.unload_model()
+        logger.info("🎉 测试完成！")
     else:
-        print("❌ Failed to load model")
+        logger.error("❌ 模型加载失败！")
